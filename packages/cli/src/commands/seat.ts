@@ -710,12 +710,29 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
   if (!daemonStatusGuard(daemon)) return; // B8-1b: epistemic-matched
 
   const client = deps.clientFactory(getDaemonUrl(daemon));
-  const res = await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(`/api/seat/handover/${encodeURIComponent(seat)}`, {
-    source: opts.source,
-    reason: opts.reason,
-    operator: opts.operator,
-    dryRun: opts.dryRun === true,
-  });
+  const route = `/api/seat/handover/${encodeURIComponent(seat)}`;
+  const body = { source: opts.source, reason: opts.reason, operator: opts.operator, dryRun: opts.dryRun === true };
+  let res;
+  try {
+    // A real handover launches and verifies a successor, which can outlast the client's default deadline. The
+    // daemon keeps working when the client stops waiting, so reaching the bound leaves the outcome unknown.
+    res = opts.dryRun === true
+      ? await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(route, body)
+      : await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(route, body, { timeoutMs: 120_000 });
+  } catch (err) {
+    if (opts.dryRun === true || !(err instanceof DaemonTimeoutError)) throw err;
+    const error = {
+      ok: false as const,
+      code: "handover_outcome_unknown",
+      status: "unknown",
+      message: "The CLI stopped waiting for the daemon after 120 seconds, so the handover outcome is unknown. The daemon may still be working on it.",
+      guidance: `Inspect the seat before considering another handover: rig seat status ${seat}. A handover result shown there may belong to an earlier attempt.`,
+    };
+    if (opts.json) console.log(JSON.stringify(error, null, 2));
+    else printSeatError(error, error.message);
+    process.exitCode = 1;
+    return;
+  }
 
   if (opts.json) {
     console.log(JSON.stringify(res.data, null, 2));

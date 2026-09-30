@@ -398,6 +398,87 @@ describe("rig seat status", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  // Handover can outlast the client's default 5 s deadline (reported in korallis/agent-stack#32), and the daemon
+  // keeps working when the client stops waiting. Both aliases share runSeatHandover; the real DaemonClient runs
+  // over a stubbed fetch and fake timers.
+  const HANDOVER_ALIASES = [["seat", "handover"], ["handover"]] as const;
+  const handoverPosts = (fetchImpl: ReturnType<typeof vi.fn>) =>
+    fetchImpl.mock.calls.filter(([url]) => String(url).includes("/api/seat/handover/")).length;
+
+  function neverAnswers() {
+    return vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+    }));
+  }
+
+  function runHandover(fetchImpl: ReturnType<typeof vi.fn>, alias: readonly string[], args: string[]) {
+    const deps = makeDeps({ status: 200, data: HANDOVER_RESULT_FRESH }, []);
+    deps.clientFactory = url => new DaemonClient(url, { fetchImpl: fetchImpl as unknown as typeof fetch });
+    return captureLogs(() => makeCommand(deps).parseAsync([
+      "node", "rig", ...alias, "dev-impl@seat-rig", "--reason", "context-wall", ...args,
+    ]).then(() => undefined)).catch(error => ({ error }));
+  }
+
+  it.each(HANDOVER_ALIASES)("handover (%s) waits for the daemon's reply beyond the default five seconds", async (...alias) => {
+    vi.useFakeTimers();
+    const fetchImpl = vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(Response.json(HANDOVER_RESULT_FRESH)), 6_000);
+      init!.signal!.addEventListener("abort", () => { clearTimeout(timer); reject(init!.signal!.reason); }, { once: true });
+    }));
+    const result = runHandover(fetchImpl, alias, ["--source", "fresh", "--json"]);
+
+    await vi.advanceTimersByTimeAsync(6_000);
+
+    const output = await result;
+    if (!("logs" in output)) throw output.error;
+    expect(output).toMatchObject({ errors: [], exitCode: undefined });
+    expect(JSON.parse(output.logs.join("\n"))).toMatchObject({ ok: true, dryRun: false });
+    expect(handoverPosts(fetchImpl)).toBe(1);
+  });
+
+  it.each(HANDOVER_ALIASES.flatMap(alias => [false, true].map(json => [alias, json] as const)))(
+    "handover (%s) at the client bound reports an unknown outcome with exactly one POST (json=%s)", async (alias, json) => {
+      vi.useFakeTimers();
+      const fetchImpl = neverAnswers();
+      const result = runHandover(fetchImpl, alias, ["--source", "fresh", ...(json ? ["--json"] : [])]);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      const output = await result;
+      if (!("logs" in output)) throw output.error;
+      expect(output.exitCode).toBe(1);
+      const text = json ? output.logs.join("\n") : output.errors.join("\n");
+      if (json) {
+        expect(output.errors).toEqual([]);
+        expect(JSON.parse(text)).toMatchObject({
+          ok: false,
+          code: "handover_outcome_unknown",
+          status: "unknown",
+          guidance: expect.stringContaining("rig seat status dev-impl@seat-rig"),
+        });
+      } else {
+        expect(output.logs).toEqual([]);
+        expect(text).toContain("handover outcome is unknown");
+        expect(text).toContain("rig seat status dev-impl@seat-rig");
+      }
+      expect(text).toContain("may still be working");
+      expect(text).not.toMatch(/cancel|handover failed|safe to retry/i);
+      expect(handoverPosts(fetchImpl)).toBe(1);
+    },
+  );
+
+  it("control: a dry-run keeps the default deadline and does not claim a handover is underway", async () => {
+    vi.useFakeTimers();
+    const fetchImpl = neverAnswers();
+    const result = runHandover(fetchImpl, ["seat", "handover"], ["--dry-run", "--json"]);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const output = await result;
+    expect("error" in output && output.error).toMatchObject({ name: "DaemonTimeoutError" });
+    expect(handoverPosts(fetchImpl)).toBe(1);
+  });
+
   it("handover --dry-run --json prints the stable planner shape", async () => {
     const paths: string[] = [];
     const deps = makeDeps({ status: 200, data: HANDOVER_PLAN }, paths);
